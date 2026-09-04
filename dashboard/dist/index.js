@@ -180,22 +180,20 @@ function ConfigView(){
   const[config,setConfig]=useState(null);
   useEffect(()=>{fetchJSON(`${API}/config`).then(setConfig).catch(console.error)},[]);
   if(!config)return React.createElement("div",{className:"alive-empty"},"加载中...");
+  var sections=Object.entries(config).map(function(entry){
+    var section=entry[0], values=entry[1]||{};
+    var rows=Object.entries(values).map(function(kv){
+      return React.createElement("div",{key:kv[0],className:"alive-emotion-row"},
+        React.createElement("span",{className:"alive-emotion-name"},kv[0]),
+        React.createElement("span",{className:"alive-emotion-val"},String(kv[1])));
+    });
+    return React.createElement("div",{key:section,style:{marginBottom:"1rem"}},
+      React.createElement("div",{style:{fontWeight:"bold",fontSize:"0.85rem",color:"#aaa",textTransform:"uppercase",marginBottom:"0.3rem"}},section),
+      rows);
+  });
   return React.createElement(Card,{className:"alive-card"},
     React.createElement(CardHeader,null,React.createElement(CardTitle,null,"⚙️ 配置")),
-    React.createElement(CardContent,null,
-      Object.entries(config).map(([section,values])=>
-        React.createElement("div",{key:section,style:{marginBottom:"1rem"}},
-          React.createElement("div",{key:section,style:{marginBottom:"1rem"}},
-          React.createElement("div",{style:{fontWeight:"bold",fontSize:"0.85rem",color:"#aaa",textTransform:"uppercase",marginBottom:"0.3rem"}},section),
-          Object.entries(values).map(([k,v])=>
-            React.createElement("div",{key:k,className:"alive-emotion-row"},
-              React.createElement("span",{className:"alive-emotion-name"},k),
-              React.createElement("span",{className:"alive-emotion-val"},String(v))
-            )
-          )
-        )
-      )
-    )
+    React.createElement(CardContent,null,sections)
   );
 }
 
