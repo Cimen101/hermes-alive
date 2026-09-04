@@ -1,0 +1,14 @@
+{
+  "name": "hermes-alive",
+  "label": "Hermes Alive",
+  "description": "拟人生命周期系统管理面板",
+  "icon": "Heart",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/alive",
+    "position": "end"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

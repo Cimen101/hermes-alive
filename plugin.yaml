@@ -1,0 +1,17 @@
+name: hermes-alive
+version: 1.0.0
+description: "拟人生命周期系统 — 作息节律、精力管理、压力感知、情绪情感、兴趣培养"
+author: "Cimen101"
+homepage: "https://github.com/Cimen101/hermes-alive"
+kind: standalone
+provides_tools:
+  - alive_status
+  - alive_rest
+provides_hooks: []
+hooks:
+  - pre_llm_call
+  - post_llm_call
+  - on_session_start
+  - on_session_end
+  - post_tool_call
+  - transform_llm_output

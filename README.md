@@ -1,0 +1,125 @@
+# hermes-alive
+
+拟人生命周期系统插件 —— 让 Agent 拥有**作息、精力、压力、情绪、兴趣与内在驱动力**，像活人一样"有状态"地存在，而不是每次对话都从零开始的无状态程序。
+
+> Agent 会在早上自然醒来、夜里犯困睡去；聊天聊久了会累、被夸了会开心；对感兴趣的话题越聊越热、太久没人理会有点无聊；空闲时偶尔主动找你分享一首歌、提醒你天气变冷——这一切不是写死的剧本，而是由一组互相耦合的生命状态实时驱动。
+
+## 特性总览
+
+| 模块 | 能力 |
+|---|---|
+| 作息时钟 | 起床/软入睡/硬入睡/晚间收尾（wind-down）时相，跨时区可配 |
+| 生命状态 | 精力、压力、无聊感实时衰减与回复；压力分层（基线/休闲判定/硬切休闲） |
+| 情绪引擎 | PAD 三维情绪空间 + 离散情绪标签 + 创伤事件记忆 |
+| 双向羁绊 | 好感度/信任/亲密随互动自然演化，影响语气与主动性 |
+| 兴趣系统 | 对话中捕获兴趣点 → 热度积累 → 淘汰/回升 → 影响主动话题选择 |
+| 内在驱动力 | 空闲时主动发起（分享/关怀/回忆），带冷却、日上限与精力门槛 |
+| 情感巡查 | 后台低频 LLM 复盘近期对话，把心理记账沉淀为状态变化（独立辅助模型槽，不烧主模型） |
+| 发送前自检 | 以"自己"的身份复核即将发出的回复：人格漂移、语境错位、markdown 残留拦截 |
+| 人格护栏 | 拟人腔漂移检测（本喵/尾巴…）与动作旁白（*歪头*）归一 |
+| 管理面板 | Dashboard 实时查看生命状态、羁绊、兴趣与巡查记录 |
+
+## 架构
+
+```
+hermes-alive/
+├── __init__.py            # 插件入口：钩子注册、巡查/自检/驱动力全链路
+├── engine/                # 生命状态机
+│   ├── clock.py           #   作息时钟（时相/睡眠判定）
+│   ├── energy.py          #   精力（活动消耗/休息回复/睡眠回复）
+│   ├── stress.py          #   压力（工作/休闲模式切换）
+│   ├── boredom.py         #   无聊感
+│   ├── emotion.py         #   PAD 情绪空间与标签
+│   ├── bond.py            #   双向羁绊
+│   ├── drive.py           #   内在驱动力（主动发起）
+│   ├── self_wake.py       #   自唤醒
+│   ├── coordinator.py     #   状态协调器（跨模块联动、注入层）
+│   ├── constants.py       #   物理常量
+│   └── config.py          #   全量配置 dataclass（clock/energy/stress/…）
+├── observer/
+│   └── patrol_context.py  # 巡查 prompt 构建/响应解析（情感事件分类、立场回顾）
+├── storage/
+│   └── db.py              # SQLite 持久层（状态/羁绊/兴趣/巡查上下文）
+├── dashboard/
+│   ├── plugin_api.py      # 面板 API（FastAPI 路由）
+│   ├── manifest.json      # 面板清单
+│   └── dist/              # 预构建前端（index.js / style.css）
+├── plugin.yaml            # 插件清单（工具/钩子声明）
+└── RULE.md                # Agent 自我约束文件（由 Agent 自己维护）
+```
+
+## 安装
+
+1. 将本目录放入 Hermes agent 的插件目录：
+
+```
+<hermes-data>/plugins/hermes-alive/
+```
+
+2. 在 `config.yaml` 的 `plugins.enabled` 中加入 `hermes-alive`。
+3. 重启网关（或宿主进程）完成装载。
+
+## 配置
+
+完整配置在 `config.yaml` 的 `plugins.entries.hermes-alive.settings.alive` 下，未配置的键均取合理默认值：
+
+```yaml
+plugins:
+  enabled:
+    - hermes-alive
+  entries:
+    hermes-alive:
+      allow_gateway_injection: true
+      settings:
+        alive:
+          clock:
+            timezone: Asia/Shanghai   # Agent 生活的时区
+            wake_time: '07:30'        # 起床
+            sleep_soft_time: '22:30'  # 软入睡（开始犯困）
+            sleep_hard_time: '23:30'  # 硬入睡
+            wind_down_start: '22:00'  # 晚间收尾
+          monitor:
+            step_interval: 10         # 每 N 步触发一次情感巡查
+            max_stall_seconds: 14400  # 低频对话下巡查最迟兑现间隔（秒）
+```
+
+### 辅助模型槽（省成本）
+
+巡查与发送前自检是高频后台链路，注册为独立 auxiliary 任务，可在 `config.yaml` 顶层为其指定便宜模型，主模型升档不带动这两条链路烧钱：
+
+```yaml
+auxiliary:
+  alive_patrol:            # 情感巡查分析（事件分类 + 立场回顾）
+    provider: openai
+    model: gpt-4o-mini
+  alive_presend:           # 发送前自检（人格/语境复核）
+    provider: openai
+    model: gpt-4o-mini
+```
+
+不配置时使用宿主默认辅助路由（provider=auto）。
+
+## 提供的工具
+
+| 工具 | 说明 |
+|---|---|
+| `alive_status` | 查询当前生命状态（精力/压力/情绪/时相/羁绊等） |
+| `alive_rest` | 主动休息（回复精力、缓解压力） |
+
+## 钩子
+
+`pre_llm_call` / `post_llm_call`（状态注入与回收）、`on_session_start` / `on_session_end`（会话生命周期记账）、`post_tool_call`（cron 护栏等）、`transform_llm_output`（发送前自检与人格归一）。
+
+## 数据
+
+全部状态持久化于 SQLite（`alive.db`），随插件数据目录存放；删除即重置 Agent 的"人生"。
+
+## 设计说明
+
+- **状态先于剧情**：所有拟人行为都从生命状态推导（精力低→懒散敷衍，压力大→语气紧绷，无聊→主动找话题），而不是随机模板。
+- **护栏分层**：模型自由发挥在外，人格护栏与发送前自检在内——越界的表达在出口处被归一，而不是压制模型的个性。
+- **后台账本**：情感巡查把对话里发生的心理事件（被夸、被忽略、共同回忆）在低频后台链路里结算成状态增量，对话线程保持干净。
+
+## License
+
+[MIT](LICENSE)

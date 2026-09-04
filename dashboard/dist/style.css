@@ -1,0 +1,26 @@
+/* Hermes Alive Dashboard Styles */
+.alive-panel{padding:1rem;max-width:900px;margin:0 auto}
+.alive-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin-bottom:1rem}
+.alive-card{background:var(--card-bg,#1a1a2e);border:1px solid var(--border,#333);border-radius:8px;padding:1rem}
+.alive-card h3{margin:0 0 0.5rem;font-size:0.9rem;color:var(--muted,#888)}
+.alive-card .value{font-size:1.8rem;font-weight:bold}
+.alive-card .label{font-size:0.75rem;color:var(--muted,#888);margin-top:0.25rem}
+.alive-bar{height:6px;background:#333;border-radius:3px;margin-top:0.5rem;overflow:hidden}
+.alive-bar-fill{height:100%;border-radius:3px;transition:width 0.3s}
+.alive-emotion-row{display:flex;justify-content:space-between;align-items:center;padding:0.4rem 0;border-bottom:1px solid #222}
+.alive-emotion-row:last-child{border-bottom:none}
+.alive-emotion-name{font-size:0.85rem}
+.alive-emotion-val{font-size:0.85rem;color:var(--muted,#888)}
+.alive-tab-bar{display:flex;gap:0.5rem;margin-bottom:1rem;border-bottom:1px solid #333;padding-bottom:0.5rem}
+.alive-tab{padding:0.4rem 0.8rem;border-radius:4px;cursor:pointer;font-size:0.85rem;background:transparent;border:1px solid transparent;color:var(--muted,#888)}
+.alive-tab.active{background:var(--active-bg,#2a2a4a);border-color:#555;color:#fff}
+.alive-history{max-height:300px;overflow-y:auto}
+.alive-history-item{padding:0.3rem 0;border-bottom:1px solid #222;font-size:0.8rem}
+.alive-empty{text-align:center;color:var(--muted,#666);padding:2rem}
+.alive-btn{padding:0.4rem 0.8rem;border-radius:4px;border:1px solid #555;background:var(--btn-bg,#2a2a4a);color:#fff;cursor:pointer;font-size:0.8rem}
+.alive-btn:hover{background:var(--btn-hover,#3a3a5a)}
+.alive-badge{display:inline-block;padding:0.15rem 0.4rem;border-radius:3px;font-size:0.7rem;font-weight:bold}
+.alive-badge-green{background:#1a4a2a;color:#4ade80}
+.alive-badge-yellow{background:#4a4a1a;color:#facc15}
+.alive-badge-red{background:#4a1a1a;color:#f87171}
+.alive-badge-blue{background:#1a2a4a;color:#60a5fa}
