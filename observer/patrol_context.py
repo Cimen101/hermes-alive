@@ -56,6 +56,25 @@ def build_patrol_prompt(engine, messages: list[dict], user_id: str,
         "只列用户明确表达过兴趣或谈及的具体事物；抽象概念、纯日程安排不算。\n"
     )
 
+    # 升级方案 §7：长期记忆沉淀段（常驻搭乘，宁缺勿滥）
+    memory_section = (
+        "\n## 附加任务：长期记忆沉淀\n"
+        "从对话中识别**有跨会话价值**的信息，在输出 JSON 顶层增加字段"
+        "（没有值得记的就输出空数组 []，最多 3 条）：\n"
+        '  "memory_ops": [\n'
+        '    {"op": "add_node", "type": "person/fact/event/topic/goal", '
+        '"title": "归一化名称，10字内", "content": "一句话事实，20字内", '
+        '"occurred_at": "YYYY-MM-DD，事件/约定必填（从对话日期与相对时间换算）", '
+        '"confidence": 0.0-1.0, "aliases": ["可选别名"], "importance": 0.0-1.0},\n'
+        '    {"op": "link", "from": "已有节点标题", "rel": "part_of/causes/relates", '
+        '"to": "另一节点标题"}\n'
+        "  ]\n"
+        "入库判据（宁缺勿滥）：身份事实、稳定偏好、承诺约定、显著事件、重要新人才记；"
+        "本轮寒暄、临时细节、正在讨论的过程性内容**不要**记。"
+        "注意：confidence 这里是记忆置信度，与上方事件的 0.6 纪律是两个独立标准。"
+        "type=emotion 仅用于重大情感里程碑（激烈冲突、和解），日常情绪不要记。\n"
+    )
+
     prompt = f"""你是一个情感分析系统，负责从对话中识别情感事件。
 
 ## 你的任务
@@ -85,7 +104,14 @@ def build_patrol_prompt(engine, messages: list[dict], user_id: str,
 负面事件：negative_feedback, neglect, trust_violation, task_failure
 特殊事件：prolonged_absence（用户长时间不在线>2小时时），interest_enjoyed（Agent做了喜欢的事时）
 混合事件：可以同时返回多个事件（如"建议很好但语气太冲"= positive_feedback + negative_feedback）
-{stance_section}{interest_section}
+
+## user_sentiment 判定标尺（重要，2026-09-06）
+user_sentiment 指**用户对我们这段互动/聊天氛围的态度**，不是用户自己处境的好坏：
+- 用户遭遇挫折、情绪低落、抱怨生活（"项目黄了""心情糟透了"）——只要 ta 在**主动向你倾诉**，
+  说明对互动是信任的，user_sentiment 应判 **neutral 或 positive**，**不要判 negative**；
+- 只有用户**对 Agent 本人**表达不满/批评/疏远/冷淡（"你不懂我""别再烦我""你说得不对"）才判 negative；
+- 聊天融洽、被安慰、解决问題→ positive；普通寒暄→ neutral。
+{stance_section}{interest_section}{memory_section}
 ## 输出格式（严格JSON）
 ```json
 {{
@@ -179,6 +205,11 @@ def parse_patrol_response(response_text: str) -> dict:
         mi = data.get("mentioned_interests")
         result["mentioned_interests"] = [x for x in mi if isinstance(x, dict)] \
             if isinstance(mi, list) else []
+
+        # 升级方案 §7：memory_ops 解析（顶层可选字段，缺失/非列表一律空处理）
+        mops = data.get("memory_ops")
+        result["memory_ops"] = [x for x in mops if isinstance(x, dict)] \
+            if isinstance(mops, list) else []
         return result
     except (json.JSONDecodeError, Exception):
         return {"detected_events": [], "topic": "", "sentiment": "neutral"}

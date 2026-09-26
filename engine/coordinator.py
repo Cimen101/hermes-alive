@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 import json
+import random
 import time as _time
 from datetime import datetime
 from .clock import ClockManager, ClockPhase
@@ -22,6 +23,24 @@ from .constants import CONSTRAINTS, apply_constraints
 
 _DEFAULT_USER = "__global__"
 _current_user_id = _DEFAULT_USER
+
+
+def _pick_heat_target(names: list, name: str | None = None) -> int:
+    """R-H/20（红队审查·兴趣马太）：事件加热目标选择——名称匹配优先；
+    无匹配则从热度排序（get_interests 按 heat DESC）的后 1/2 冷门段随机
+    采样一个，打破"热门恒热/冷门恒冷"的自我强化环。返回下标，空集 -1。"""
+    if not names:
+        return -1
+    if name:
+        n_low = str(name).strip().lower()
+        if n_low:
+            for i, n in enumerate(names):
+                if n and (n_low in str(n).lower() or str(n).lower() in n_low):
+                    return i
+    lo = len(names) // 2
+    if lo >= len(names):
+        return len(names) - 1
+    return random.randint(lo, len(names) - 1)
 
 
 
@@ -48,6 +67,7 @@ class AliveEngine:
         _current_user_id = _DEFAULT_USER
         self._current_user_id = _DEFAULT_USER  # Instance attribute for hook access
         self._is_self_wake: bool = False
+        self._stress_reset_this_sleep: bool = False  # R-H/35：睡眠全程只重置一次计时
         self._init_defaults()
 
     def set_user(self, user_id: str):
@@ -116,6 +136,7 @@ class AliveEngine:
 
         # ── per-user：情感/关系衰减、创伤、兴趣热度、队列投递（关系因对话人而异）──
         self._decay_emotional_daily()  # R13/G1：每日一次（原每分钟=设计值的1440倍）
+        self._decay_memory_activation_daily()  # R-H/26：记忆激活计数每日衰减（全局一次）
         if self.bond.get_t() < self.cfg.bond.trauma_threshold:
             if not self.bond.is_trauma_active():
                 self.bond.trigger_trauma()
@@ -132,12 +153,37 @@ class AliveEngine:
         self._phys_last_tick = now
         self._energy_at_tick_start = self.energy.get()
 
+        prev_phase = self.clock.get_phase()
         clock_event = self.clock.tick()
         if clock_event:
             events.append(clock_event)
 
         phase = self.clock.get_phase()
+        # R-H/27（45h 生命周期模拟复检）：夜间唤醒重置无聊度——睡一觉恢复
+        # 对世界的新鲜感；否则睡前 boredom=100 一路带到次晨，一起床就
+        # boredom_high 立即触发 drive（不拟人）。
+        # R-H/30（红队）：夜间醒来=新清醒起点（重置 last_wake_ts）。
+        # 睡眠段仅在 resting 时调 end_rest()，入睡前未在休息则 last_wake_ts
+        # 不更新→次晨 minutes_since_last_wake 跨天累计（≈19h）→
+        # 早上 8 点就误报 wake_cap「清醒超 120 分钟」（跨天累计缺陷）。
+        if (prev_phase == ClockPhase.SLEEPING
+                and phase in (ClockPhase.WARMING_UP, ClockPhase.WAKING)):
+            self.boredom.set(self.cfg.boredom.initial)
+            events.append("boredom:reset_at_wake")
+            self.self_wake._set("last_wake_ts", _time.time())
+            # R-H/34（红队）：夜醒=新清醒周期，重新武装 wake_cap 一次性信号
+            self.self_wake._set("wake_cap_signaled", 0)
         resting = self.self_wake.is_resting()
+        # R-H/35：睡眠入口 = 工作段中断 → 连续工作计时与压力加速归零
+        # （原计时跨午睡/夜间累计，睡醒立刻按「连续 180min ×2.5」工作，不拟人）
+        # 相位机转移 或 force_sleep 提前置位（goodnight 路径）都要重置；
+        # latch 保证睡眠全程只重置一次，避免每分钟写库。
+        if phase == ClockPhase.SLEEPING:
+            if prev_phase != ClockPhase.SLEEPING or not self._stress_reset_this_sleep:
+                self.stress.reset_work_timer()
+                self._stress_reset_this_sleep = True
+        else:
+            self._stress_reset_this_sleep = False
 
         if resting and phase != ClockPhase.SLEEPING:
             # ── 能量小憩：精力恢复（设计01：与夜间睡眠解耦）──
@@ -146,6 +192,7 @@ class AliveEngine:
             self.stress.set(self.stress.get() - self.cfg.stress.decrease_idle)
             self.stress.decay_frustration(1.0)
             self.boredom.tick_resting(1.0)
+            self.stress.anchor_tick()   # R-H/36：小憩期间推进计时基准
             if self.energy.can_self_wake():
                 self.self_wake.end_rest()
                 events.append("self_wake:ready")
@@ -153,6 +200,7 @@ class AliveEngine:
             # ── 夜间睡眠：精力恢复（睡眠刷新，衰减×0），压力按睡眠速率下降 ──
             self.energy.recover_rest(1.0)
             self.stress.set(self.stress.get() - self.cfg.stress.decrease_sleep)
+            self.stress.anchor_tick()   # R-H/36：睡眠期间推进计时基准
             if self.self_wake.is_resting():
                 self.self_wake.end_rest()
         else:
@@ -163,8 +211,11 @@ class AliveEngine:
             # scheduler 已把主用户排在最前，正常推进均发生在主用户上下文）
             self.stress.tick(self.emotion.get_p(), self.emotion.get_a())
             # R12/D5（设计14 §3.2）：清醒休闲=低挑战代理，无聊度按配置速率上升
+            # R-H/11（红队审查）：工作模式也温和上涨（重复劳动一样会乏味）
             if self.stress.get_mode() == StressMode.LEISURE:
                 self.boredom.tick_waking(1.0)
+            else:
+                self.boredom.tick_working(1.0)
             # 压力系统决定干什么（返回决策点事件供提示词注入）
             stress_event = self.stress.check_mode_switch()
             if stress_event:
@@ -174,11 +225,30 @@ class AliveEngine:
                                      json.dumps({"stress": self.stress.get()}))
                 events.append(stress_event)
             # 精力只控制唤醒/休息：耗尽→进入能量小憩（不是夜间睡眠！）
-            if self.energy.is_depleted() and not resting:
+            # R-H/4（红队审查）：hard_rest_threshold(30) 强制级硬限制原从未生效
+            # （只在 energy<=0 才小憩）；先按硬限制收尾，耗尽作兜底。
+            if self.energy.get() <= self.cfg.energy.hard_rest_threshold and not resting:
                 self.self_wake.start_rest()
+                self.stress.reset_work_timer()   # R-H/35：小憩开始 = 工作段中断
+                events.append("energy:rest_started")
+                self.db.log_event("rest_started", "engine", uid,
+                                  json.dumps({"reason": "energy_hard_rest"}))
+            elif self.energy.is_depleted() and not resting:
+                self.self_wake.start_rest()
+                self.stress.reset_work_timer()   # R-H/35：小憩开始 = 工作段中断
                 events.append("energy:rest_started")
                 self.db.log_event("rest_started", "engine", uid,
                                   json.dumps({"reason": "energy_depleted"}))
+
+            # R-H/4：最大清醒时长（SelfWakeConfig.max_duration）——到点引导收尾
+            # R-H/4c：一次性信号（wake_cap_signaled），避免每分钟重复注入刷屏
+            wake_mins = self.self_wake.minutes_since_last_wake()
+            if (wake_mins is not None
+                    and wake_mins >= self.cfg.self_wake.max_duration
+                    and not resting and not self.clock.is_sleeping()):
+                if not self._raw_state_get("wake_cap_signaled", uid):
+                    self._raw_state_set("wake_cap_signaled", 1, uid)
+                    events.append("energy:wake_cap")
 
         # 设计14：内在驱动力发起检查（仅在清醒非休息相位）
         drive_event = self._check_drive_initiate()
@@ -230,6 +300,23 @@ class AliveEngine:
         self.bond.tick_decay()
         self._raw_state_set("last_decay_date", today, self._current_user_id)
 
+    def _decay_memory_activation_daily(self) -> None:
+        """R-H/26（红队）：记忆激活计数每日 ×0.8 衰减（全局一天一次）。
+
+        原 activation_count 只增不减 → 计数通胀 + consolidation 冷门判定
+        （activation<=1）失效 → 高频话题记忆永不淘汰（存储侧马太）。
+        """
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self._raw_state_get("mem_activation_decay_date", "__global__") == today:
+                return
+            ms = getattr(self, "memory_store", None)
+            if ms is not None and hasattr(ms, "decay_activation"):
+                ms.decay_activation(0.8)
+            self._raw_state_set("mem_activation_decay_date", today, "__global__")
+        except Exception:
+            pass
+
     def _decay_interest_heat_daily(self) -> None:
         # R15/I1（设计06 §3.3 无用户维）：兴趣库全局唯一——衰减对象与幂等标记
         # 统一 __global__，与巡查采集、独白取材同源。
@@ -260,16 +347,23 @@ class AliveEngine:
         except Exception:
             pass
 
-    def _heat_bump_top(self, delta: float, on_experience: bool = False) -> None:
+    def _heat_bump_top(self, delta: float, on_experience: bool = False,
+                       name: str | None = None) -> None:
         """R15/I3（设计03 §3.4/§5.3）：兴趣事件命中时热度回升。
 
-        事件不带条目名，取当前热度 Top1 启发式；封顶 100，表空静默跳过。
+        R-H/20（红队审查·兴趣马太）：目标选择改走 _pick_heat_target——
+        事件名称匹配优先；无匹配时从冷门段随机采样，不再恒定加热热度 Top1
+        （原实现导致热门恒热/冷门恒冷，注入内容自我强化单调化）。
         """
         try:
             tops = self.db.get_interests(active_only=True, user_id="__global__")
             if not tops:
                 return
-            item = tops[0]
+            names = [str(item.get("name") or "") for item in tops]
+            idx = _pick_heat_target(names, name)
+            if idx < 0:
+                return
+            item = tops[idx]
             item["heat"] = min(100.0, float(item.get("heat") or 50.0) + delta)
             if on_experience:
                 item["times_experienced"] = int(item.get("times_experienced") or 0) + 1
@@ -360,6 +454,21 @@ class AliveEngine:
             self.bond.apply_deltas(
                 c=validated_bond.get("c", 0), d_rel=validated_bond.get("d_rel", 0),
                 i=validated_bond.get("i", 0), t=validated_bond.get("t", 0))
+        # R-H/44（红队）：创伤修复计数——创伤期内每一次被约束链放行的正向信任
+        # 修复累计，达 trauma_clear_per_positive_count 即解除创伤（原设计承诺
+        # 「修复可解除」却从未实现，只有 7 天窗口到期+信任回弹才脱出；低信任
+        # 时 penalty×0.5 拖慢回弹 → 永续创伤锁）。解除即破锁。
+        # R-H/44b：解除须同时满足「信任已回到脱敏线（trauma_threshold）以上」——
+        # 防 5 次微修复（各 +0.001）在信任仍深度为负时廉价解除（非真实修复）。
+        if self.bond.is_trauma_active() and validated_bond.get("t", 0.0) > 1e-9:
+            n = self.bond.bump_repair()
+            if (n >= int(self.cfg.bond.trauma_clear_per_positive_count or 5)
+                    and self.bond.get_t() >= float(self.cfg.bond.trauma_threshold)):
+                self.bond.clear_trauma()
+                self.db.log_event("trauma_cleared", "repair_count",
+                                  self._current_user_id,
+                                  json.dumps({"repairs": n,
+                                              "trust": round(self.bond.get_t(), 4)}))
 
         self.db.log_event("emotion_update", "patrol", self._current_user_id,
             json.dumps({"pad": validated_pad, "bond": validated_bond,
@@ -442,9 +551,24 @@ class AliveEngine:
         parts.append(self._social_stance_paragraph())
 
         phase = self.clock.get_phase()
-        phase_map = {"waking": "清醒中", "winding_down": "犯困中",
-                     "sleeping": "睡眠中", "warming_up": "刚睡醒"}
-        parts.append(f"当前阶段：{phase_map.get(phase, phase)}")
+        # R-H/13（红队审查）：夜半被吵醒——睡眠中收到用户消息时注入
+        # "迷糊被吵醒"的第一人称感知（数据区，LLM 自然演绎），而非冷冰冰
+        # 的"睡眠中"；不改相位、不打断次日作息。
+        if phase == ClockPhase.SLEEPING:
+            _just_woken = False
+            try:
+                _lts = self._raw_state_get("last_user_message_ts", self._current_user_id)
+                _just_woken = _lts is not None and (_time.time() - float(_lts)) < 180
+            except (TypeError, ValueError):
+                _just_woken = False
+            if _just_woken:
+                parts.append("我刚被叫醒，睡得迷迷糊糊的，脑子还有点糊，说话可能慢半拍。")
+            else:
+                parts.append("当前阶段：睡眠中")
+        else:
+            phase_map = {"waking": "清醒中", "winding_down": "犯困中",
+                         "warming_up": "刚睡醒"}
+            parts.append(f"当前阶段：{phase_map.get(phase, phase)}")
         # 发现#11：注入层原本缺失绝对日期，模型对「明早/后天」等跨日表达
         # 全靠猜→日期系统性错。这里提供权威锚点（数据区，仅感知）。
         _now = datetime.now()
@@ -519,10 +643,14 @@ class AliveEngine:
         self._raw_state_set("_last_snapshot", json.dumps(self.get_state_summary()), _current_user_id)
 
     def init_first_message(self, user_message):
-        """首条消息快速校准（每会话一次，由调用方管理flag）。"""
+        """首条消息快速校准（每会话一次，由调用方管理flag）。
+
+        2026-09-06 评审：PAD 情绪维度只接受 LLM 分析驱动（patrol/反思链路），
+        本方法不再用关键词规则直接改写 PAD——负面首条只留事件标记，供 patrol
+        上下文观测；PAD 的实际校准交由后续 alive_patrol LLM 综合结算。
+        """
         lower = user_message.lower()
         negative = ["难过", "伤心", "痛苦", "悲伤", "离开", "去世", "死了", "哭",
                     "sad", "cry", "hurt", "pain", "loss", "grief", "depressed"]
         if any(s in lower for s in negative):
-            self.emotion.apply_delta(-0.10, 0.03, -0.02)
             self.db.log_event("quick_calibration", "system", self._current_user_id)

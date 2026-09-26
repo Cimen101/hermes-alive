@@ -33,16 +33,18 @@ class EnergyConfig:
     # 唤醒期间衰减（工作/休闲）
     decay_rate: float = 0.4          # 工作时精力衰减/分钟
     decay_leisure: float = 0.2       # 休闲时精力衰减/分钟（比工作慢）
-    decay_winding_down: float = 1.5  # 犯困阶段衰减倍率
     # 休息恢复（每分钟）
     recovery_rest_rate: float = 0.4  # 休息时精力恢复/分钟（40→100约150分钟）
     # 自唤醒
     self_wake_threshold: float = 100.0  # 自唤醒所需精力（必须回满）
-    self_wake_resume: float = 70.0      # 唤醒后继续工作的精力门槛
-    wrap_up_threshold: float = 40.0     # 精力40：引导级收尾（决策点）
+    self_wake_resume: float = 70.0      # 唤醒后继续工作的精力门槛（can_continue_working）
+    wrap_up_threshold: float = 40.0     # 精力40：引导级收尾（决策点；dashboard 展示）
     hard_rest_threshold: float = 30.0   # 精力30：强制级硬限制
-    rest_suggest: float = 30.0
-    sleep_refresh: bool = True
+    # 09-13 死配置审计（R-H/43）：decay_winding_down / rest_suggest / sleep_refresh /
+    # recovery_interest / recovery_interest_ceiling / fatigue_thresholds /
+    # fatigue_multipliers 七个键全库零读取——犯困倍率实际由 clock 相位倍率承载、
+    # 睡眠刷新由 coordinator 睡眠分支直接执行、疲劳加速由 stress.work_acceleration_*
+    # 承载、兴趣恢复无 wiring。已删除，避免误导调参。
     # 一次性恢复（用户交互）
     recovery_rest: float = 8.0
     recovery_short_rest: float = 18.0
@@ -50,14 +52,10 @@ class EnergyConfig:
     recovery_task_done: float = 5.0
     recovery_chat: float = 0.8
     recovery_chat_ceiling: float = 75.0
-    recovery_interest: float = 0.6
-    recovery_interest_ceiling: float = 70.0
     recovery_encourage: float = 3.0
     recovery_encourage_ceiling: float = 80.0
     recovery_praise_ceiling: float = 80.0
     recovery_task_ceiling: float = 85.0
-    fatigue_thresholds: list[int] = field(default_factory=lambda: [30, 60, 120])
-    fatigue_multipliers: list[float] = field(default_factory=lambda: [1.0, 1.2, 1.5, 2.0])
 
 
 @dataclass
@@ -72,17 +70,14 @@ class StressConfig:
     work_priority_threshold: float = 10.0     # 休闲→工作优先节点（引导级）
     # 速率
     increase_work: float = 0.7           # 工作时压力增长/分钟
-    increase_complex: float = 0.25
-    increase_repetitive: float = 0.30
-    increase_tool_fail: float = 2.0
-    increase_user_criticize: float = 5.0
-    increase_user_correct: float = 1.5
+    # 09-13 死配置审计（R-H/41）：increase_complex / increase_repetitive /
+    # increase_user_criticize / increase_user_correct / increase_tool_fail /
+    # decrease_interest / decrease_praise / decrease_task_done 八个键全库零读取
+    # ——事件效果实际由 apply_event 的挫折点权重（负向）+ energy recover_*（正向）
+    # 承载，旧值是直接压力增减时代的残留，只会误导调参。已删除。
     decrease_idle: float = 0.5           # 休闲时压力降低/分钟
     decrease_browse: float = 0.10
-    decrease_interest: float = 0.15
     decrease_sleep: float = 0.30
-    decrease_praise: float = 5.0
-    decrease_task_done: float = 3.0
     decrease_encourage: float = 4.0
     decrease_rest: float = 8.0
     decrease_fun: float = 6.0
@@ -118,6 +113,8 @@ class BoredomConfig:
     decrease_new_thing: float = 10.0
     # R12/D5（设计14 §3.2 实装形态）：清醒+休闲模式下无聊度温和上升速率/分钟
     increase_waking_leisure: float = 0.15
+    # R-H/11（红队审查）：工作模式无聊度上涨速率/分钟（低于休闲）
+    increase_working: float = 0.05
 
 
 @dataclass
@@ -177,7 +174,9 @@ class BondConfig:
     trauma_threshold: float = 0.1  # 降低阈值到0.1，只有严重背叛才触发
     trauma_window_days: int = 7
     trauma_positive_penalty: float = 0.5
-    trauma_clear_per_repair: float = 0.5
+    # R-H/44（红队）：trauma_clear_per_repair 原为死配置（clear_trauma(fraction)
+    # 的分支从未实现）已删除；修复统一走「正向信任修复计数」——
+    # trauma_clear_per_positive_count 次成功的创伤期正向信任修复即解除创伤。
     trauma_clear_per_positive_count: int = 5
     relationship_maturity_days: int = 30
 
@@ -187,14 +186,48 @@ class MonitorConfig:
     enabled: bool = True
     # 巡查模型由宿主 auxiliary.alive_patrol/alive_presend 槽决定（R13/G5），
     # 此处不设 model——历史上该键是死配置，只会误导调参（09-03 死配置审计）。
-    step_interval: int = 10
+    # PAD/bond 情绪结算仅由 patrol LLM 驱动（2026-09-06 评审：PAD 不接受规则
+    # 直写）。为满足"情绪及时结算"，巡查周期由 10 步缩短为 4 步——真实对话
+    # 节奏下 PAD 延迟从最多 10 轮降到最多 4 轮；辅助分析调用增量极小
+    # （每次约 1.5k tokens，按每日数十轮对话量级可忽略）。
+    step_interval: int = 4
     # R1（09-01）：距上次巡查超过该秒数且本轮≥2步即兜底触发（0=禁用）。
     # 低频对话下轮数门要等几天，心理记账（表扬回血/无聊度回落）会饿死。
-    max_stall_seconds: int = 14400
+    # 2026-09-06：由 14400（4h）缩短为 3600（1h），保证低频用户也能及时结算。
+    max_stall_seconds: int = 3600
     max_context_messages: int = 20
     confidence_threshold: float = 0.6
     high_confidence: float = 0.8
     quick_calibration_p_floor: float = -0.3
+
+
+@dataclass
+class MemoryConfig:
+    """DAG 长期记忆库配置（升级方案 §12）。"""
+    enabled: bool = True
+    inject_budget_tokens: int = 600
+    top_k: int = 8
+    expand_depth: int = 1
+    second_hop_weight: float = 0.4
+    max_active_nodes: int = 400
+    min_confidence: float = 0.4
+    jaccard_dedup_threshold: float = 0.4  # 重叠系数（n-gram 短文本去重）
+    patrol_sediment: bool = True
+    initial_import: bool = True
+    recall_tool_enabled: bool = True
+    # v2.4 §21：经历记忆层（反思流）
+    reflection_enabled: bool = True
+    reflection_trigger_rounds: int = 10   # 每 session 攒够 N 轮真用户对话即回顾
+    reflection_context_window: int = 40   # 回顾时取会话尾部消息数
+    inject_entries_top_k: int = 3         # 被动注入为经历条目保留的槽位数
+    # v2.4 §22：向量路（1:1 复刻 FAISS 向量检索；OpenAI 兼容 /embeddings 协议）
+    # provider 任意 OpenAI 兼容服务（openai/硅基流动/智谱/ollama+base_url 均可）；
+    # api_key 为空时向量路自动关闭，其余三路照常。
+    embedding_provider: str = ""          # 显示用（如 "openai"/"siliconflow"）
+    embedding_model: str = ""             # 模型名（如 text-embedding-3-small/bge-m3）
+    embedding_api_key: str = ""           # apikey（敏感，留空=向量路关闭）
+    embedding_base_url: str = ""          # 如 https://api.siliconflow.cn/v1（留空用 provider 默认）
+    embedding_dim: int = 0                # 向量维度（0=自动取首次返回维度）
 
 
 @dataclass
@@ -248,6 +281,7 @@ class AliveConfig:
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     social: SocialConfig = field(default_factory=SocialConfig)
     drive: DriveConfig = field(default_factory=DriveConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
 
 def _coerce(val, target_type):
@@ -275,7 +309,7 @@ def load_config(get_config_fn) -> AliveConfig:
     """Load config from Hermes plugin settings, falling back to defaults."""
     cfg = AliveConfig()
     prefix = "alive"
-    for section_name in ["clock", "energy", "stress", "boredom", "self_wake", "hobby", "emotion", "bond", "monitor", "social", "drive"]:
+    for section_name in ["clock", "energy", "stress", "boredom", "self_wake", "hobby", "emotion", "bond", "monitor", "social", "drive", "memory"]:
         section = getattr(cfg, section_name)
         for field_name in section.__dataclass_fields__:
             key = f"{prefix}.{section_name}.{field_name}"

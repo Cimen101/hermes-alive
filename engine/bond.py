@@ -69,12 +69,27 @@ class BondManager:
         self._set("trauma_active", 1)
         self._set("trauma_started_at", datetime.now().isoformat())
 
-    def clear_trauma(self, fraction: float = 1.0) -> None:
+    def clear_trauma(self) -> None:
+        """解除创伤（全量）。R-H/44：原 fraction 参数为死代码（<1.0 空操作），
+        「部分修复清除」从未实现——修复统一走 repair_count 累计（见
+        get_repair_count/bump_repair，达 trauma_clear_per_positive_count 即解除）。"""
         if not self.is_trauma_active():
             return
-        if fraction >= 1.0:
-            self._set("trauma_active", 0)
-            self._set("trauma_started_at", "")
+        self._set("trauma_active", 0)
+        self._set("trauma_started_at", "")
+        self._set("trauma_repair_count", 0)
+
+    def get_repair_count(self) -> int:
+        """R-H/44：创伤修复累计——创伤期内每次成功的正向信任修复 +1。"""
+        try:
+            return int(self._get("trauma_repair_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def bump_repair(self) -> int:
+        n = self.get_repair_count() + 1
+        self._set("trauma_repair_count", n)
+        return n
 
     def get_trauma_multiplier(self) -> float:
         if not self.is_trauma_active():

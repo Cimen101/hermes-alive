@@ -23,8 +23,13 @@ function AlivePanel(){
   const[status,setStatus]=useState(null);
   const[history,setHistory]=useState([]);
   const[users,setUsers]=useState([]);
+  const[memUsers,setMemUsers]=useState([]);
   const[selectedUser,setSelectedUser]=useState("__global__");
   const[loading,setLoading]=useState(true);
+  const[memTab,setMemTab]=useState("nodes");
+  const[memNodes,setMemNodes]=useState([]),[memQuery,setMemQuery]=useState(""),[memGraph,setMemGraph]=useState(null),[memRecall,setMemRecall]=useState(null);
+  const loadMemory=useCallback(async()=>{try{const n=await fetchJSON(`${API}/memory/nodes?user_id=${selectedUser}&limit=50`);setMemNodes(n);const g=await fetchJSON(`${API}/graph?user_id=${selectedUser}`);setMemGraph(g.snapshot)}catch(e){console.error(e)}},[selectedUser]);
+  const recallMemory=useCallback(async()=>{if(!memQuery.trim())return;try{setMemRecall(await fetchJSON(`${API}/memory/recall?user_id=${selectedUser}&q=${encodeURIComponent(memQuery)}&top_k=10`))}catch(e){console.error(e)}},[selectedUser,memQuery]);
 
   const loadStatus=useCallback(async()=>{
     try{
@@ -46,23 +51,80 @@ function AlivePanel(){
       setUsers(u);
     }catch(e){console.error(e)}
   },[]);
-
-  useEffect(()=>{loadUsers()},[loadUsers]);
-  useEffect(()=>{loadStatus();loadHistory();setLoading(false)},[loadStatus,loadHistory]);
+  const loadMemUsers=useCallback(async()=>{
+    try{
+      const u=await fetchJSON(`${API}/memory/users`);
+      setMemUsers(Array.isArray(u)?u:[]);
+    }catch(e){console.error(e)}
+  },[]);
+  useEffect(()=>{loadUsers();loadMemUsers()},[loadUsers,loadMemUsers]);
+  useEffect(()=>{loadStatus();loadHistory();loadMemory();setLoading(false)},[loadStatus,loadHistory,loadMemory]);
 
   if(loading)return React.createElement("div",{className:"alive-empty"},"加载中...");
 
   return React.createElement("div",{className:"alive-panel"},
     React.createElement("div",{className:"alive-tab-bar"},
       React.createElement("span",{style:{fontWeight:"bold",marginRight:"1rem"}},"💓 Alive"),
-      ["status","history","config"].map(t=>
+      ["status","history","memory","config"].map(t=>
         React.createElement("button",{key:t,className:`alive-tab ${tab===t?"active":""}`,onClick:()=>setTab(t)},
-          {status:"状态",history:"历史",config:"配置"}[t])
+          {status:"状态",history:"历史",memory:"记忆",config:"配置"}[t])
       )
     ),
     tab==="status"&&React.createElement(StatusView,{status,users,selectedUser,setSelectedUser,loadStatus}),
     tab==="history"&&React.createElement(HistoryView,{history}),
+    tab==="memory"&&React.createElement(MemoryView,{memTab,setMemTab,memNodes,memGraph,memQuery,setMemQuery,memRecall,recallMemory,loadMemory,memUsers,selectedUser,setSelectedUser,loadMemUsers}),
     tab==="config"&&React.createElement(ConfigView)
+  );
+}
+
+
+function MemoryView({memTab,setMemTab,memNodes,memGraph,memQuery,setMemQuery,memRecall,recallMemory,loadMemory,memUsers,selectedUser,setSelectedUser,loadMemUsers}){
+  const canvasRef=React.useRef(null);
+  useEffect(()=>{const c=canvasRef.current,g=memGraph;if(!c||!g)return;const x=c.getContext("2d");x.clearRect(0,0,c.width,c.height);const ns=g.nodes||[],es=g.edges||[],m={};const deg={};ns.forEach(n=>deg[n.id]=0);es.forEach(e=>{if(deg[e.from_id]!=null&&deg[e.to_id]!=null){deg[e.from_id]++;deg[e.to_id]++}});const ordered=[...ns].sort((a,b)=>(deg[b.id]||0)-(deg[a.id]||0));ordered.forEach((n,i)=>{const ring=Math.max(1,Math.ceil((i+1)/8)),slot=i%8,count=Math.min(8,ordered.length-(ring-1)*8),r=ring===1?0:65*ring,angle=count===1?-Math.PI/2:(slot/count)*Math.PI*2;m[n.id]={x:400+(r?Math.cos(angle)*r:0),y:180+(r?Math.sin(angle)*r:0),n}});x.lineWidth=1.5;es.forEach(e=>{const a=m[e.from_id],b=m[e.to_id];if(!a||!b)return;x.strokeStyle="#64748b";x.beginPath();x.moveTo(a.x,a.y);x.lineTo(b.x,b.y);x.stroke();const ang=Math.atan2(b.y-a.y,b.x-a.x);x.fillStyle="#94a3b8";x.beginPath();x.moveTo(b.x-10*Math.cos(ang-.45),b.y-10*Math.sin(ang-.45));x.lineTo(b.x,b.y);x.lineTo(b.x-10*Math.cos(ang+.45),b.y-10*Math.sin(ang+.45));x.fill()});ordered.forEach(n=>{const p=m[n.id];x.fillStyle=deg[n.id]?"#38bdf8":"#64748b";x.beginPath();x.arc(p.x,p.y,10,0,Math.PI*2);x.fill();x.fillStyle="#e2e8f0";x.font="12px sans-serif";x.fillText((n.title||n.content||"").slice(0,18),p.x+14,p.y+4)})},[memGraph,memTab]);
+  const recallItems=memRecall?(Array.isArray(memRecall.items)?memRecall.items:(Array.isArray(memRecall.results)?memRecall.results:(Array.isArray(memRecall.data)?memRecall.data:[]))):[];
+  return React.createElement("div",{className:"alive-memory"},
+    React.createElement("div",{className:"alive-tab-bar"},
+      ["nodes","graph","recall"].map(t=>React.createElement("button",{key:t,className:`alive-tab ${memTab===t?"active":""}`,onClick:()=>setMemTab(t)},({nodes:"节点",graph:"图谱",recall:"检索"})[t]))
+    ),
+    memUsers&&memUsers.length>0&&React.createElement("div",{style:{marginBottom:"1rem",display:"flex",alignItems:"center",gap:"0.5rem"}},
+      React.createElement("span",{style:{fontSize:"0.8rem",color:"#888"}},"用户:"),
+      React.createElement("select",{value:selectedUser,onChange:e=>setSelectedUser(e.target.value),
+        style:{background:"#1a1a2e",color:"#fff",border:"1px solid #333",borderRadius:"4px",padding:"0.3rem"}
+      },
+        React.createElement("option",{value:"__global__"},"全局"),
+        memUsers.map(u=>React.createElement("option",{key:u.user_id,value:u.user_id},`${u.user_id}（${u.node_count}节点）`))
+      ),
+      React.createElement(Button,{onClick:()=>{loadMemory();loadMemUsers()},style:{fontSize:"0.75rem"}},"刷新")
+    ),
+    memTab==="nodes"&&React.createElement(Card,{className:"alive-card"},
+      React.createElement(CardHeader,null,React.createElement(CardTitle,null,"📂 记忆节点"),React.createElement(Button,{onClick:loadMemory},"刷新")),
+      React.createElement(CardContent,null,(memNodes||[]).map(n=>React.createElement("div",{key:n.id,className:"alive-memory-row"},React.createElement("b",null,n.title||n.content||""),React.createElement("span",{style:{marginLeft:".6rem",color:"#888"}},n.type," / ",n.atom_type||""," / ",n.content||""))))
+    ),
+    memTab==="graph"&&React.createElement(Card,{className:"alive-card"},
+      React.createElement(CardHeader,null,React.createElement(CardTitle,null,"🕸️ 记忆图谱")),
+      React.createElement(CardContent,null,React.createElement("canvas",{ref:canvasRef,width:800,height:360,style:{width:"100%",background:"#111827",borderRadius:"6px"}}))
+    ),
+    memTab==="recall"&&React.createElement(Card,{className:"alive-card"},
+      React.createElement(CardHeader,null,React.createElement(CardTitle,null,"🔎 检索记忆")),
+      React.createElement(CardContent,null,
+        React.createElement("div",{style:{display:"flex",gap:".5rem",marginBottom:"1rem"}},React.createElement("input",{value:memQuery||"",onChange:e=>setMemQuery(e.target.value),onKeyDown:e=>e.key==="Enter"&&recallMemory(),placeholder:"检索记忆",style:{flex:1}}),React.createElement(Button,{onClick:recallMemory},"检索")),
+        recallItems.length?recallItems.slice(0,6).map((item,i)=>React.createElement(Card,{key:item.id||item.memory_id||i,className:"alive-card"},React.createElement(CardContent,null,
+          React.createElement("div",{style:{display:"flex",alignItems:"center",gap:".5rem",flexWrap:"wrap"}},
+            React.createElement("b",null,item.title||item.summary||item.content||`记忆 ${item.memory_id||i+1}`),
+            item.type&&React.createElement("span",{style:{fontSize:"0.65rem",padding:"0.1rem 0.5rem",borderRadius:"999px",background:"#1e3a5f",color:"#7dd3fc"}},item.type),
+            item.route&&React.createElement("span",{style:{fontSize:"0.65rem",padding:"0.1rem 0.5rem",borderRadius:"999px",background:"#3b2f63",color:"#c4b5fd"}},item.route)
+          ),
+          (item.content||item.summary||item.text)&&React.createElement("div",{style:{marginTop:".45rem",color:"#cbd5e1",fontSize:"0.85rem",whiteSpace:"pre-wrap",lineHeight:1.5}},String(item.content||item.summary||item.text).slice(0,140)),
+          React.createElement("div",{style:{marginTop:".45rem",display:"flex",gap:".6rem",flexWrap:"wrap",fontSize:"0.7rem",color:"#64748b"}},
+            (item.occurred_at||item.created_at)&&React.createElement("span",null,"🕒 ",item.occurred_at||item.created_at),
+            (item.score!=null)&&React.createElement("span",null,"score ",Number(item.score).toFixed(3)),
+            (item.rrf!=null)&&React.createElement("span",null,"rrf ",Number(item.rrf).toFixed(4)),
+            Array.isArray(item.routes)&&item.routes.length?React.createElement("span",null,"routes: ",item.routes.join(" · ")):null,
+            (item.importance!=null)&&React.createElement("span",null,"importance ",item.importance)
+          )
+        ))) :React.createElement("div",{className:"alive-empty"},memRecall?"未找到相关记忆（可尝试选择具体用户）":"请输入查询")
+      )
+    )
   );
 }
 

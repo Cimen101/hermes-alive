@@ -28,6 +28,10 @@ class SelfWakeManager:
     def end_rest(self) -> None:
         self._set("energy_resting", 0)
         self._set("last_wake_ts", _time.time())
+        # R-H/34（红队）：新清醒周期开始，重置一次性 wake_cap 信号——
+        # 原只置 1 从不重置，清醒超时提醒一生只触发一次；能量小憩/睡眠后
+        # 应重新武装，让每个清醒周期都能再提醒。
+        self._set("wake_cap_signaled", 0)
 
     def rest_duration_minutes(self) -> float:
         started = self._get("rest_started_at", None)

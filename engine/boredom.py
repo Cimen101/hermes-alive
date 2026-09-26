@@ -35,6 +35,14 @@ class BoredomManager:
             return
         self.set(self.get() + self.cfg.increase_waking_leisure * minutes)
 
+    def tick_working(self, minutes: float = 1.0) -> None:
+        """R-H/11（红队审查）：工作模式无聊度也温和上涨——重复劳动一样会
+        乏味；速率低于休闲（increase_working < increase_waking_leisure），
+        避免高强度工作中频繁触发 drive。"""
+        if minutes <= 0:
+            return
+        self.set(self.get() + self.cfg.increase_working * minutes)
+
     def on_new_thing(self) -> None:
         """遇到新事物/做了喜欢的事，无聊度下降。"""
         self.set(self.get() - self.cfg.decrease_new_thing)

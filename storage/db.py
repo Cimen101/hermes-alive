@@ -1,29 +1,62 @@
 """SQLite storage layer — multi-user isolated, single source of truth."""
 
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger("hermes_alive.db")
 _DEFAULT_USER = "__global__"
+
+# R-H/24（红队第二轮深度修复）：进程内多线程写锁——AliveDB 每线程独立连接，
+# 线程并发写同库会使 WAL checkpoint 竞争更激烈；用类级锁把写串行化，
+# 与 SQLite 自身的 WAL 单写者语义对齐，从根上降低索引/日志竞态概率。
+# R-H/26：改用 RLock 支持嵌套（store.search_fused 锁内再调 wake_entry 等写方法）。
+_WRITE_LOCK = threading.RLock()
 
 
 class AliveDB:
     """Thread-safe SQLite wrapper with per-user state isolation."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, read_only: bool = False) -> None:
         self._db_path = db_path
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = bool(read_only)
+        if not self._read_only:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._event_keep = 5000      # event_log 保留上限，约束长期增长
         self._event_insert_count = 0
-        self._init_schema()
+        self._integrity_checked = False
+        if not self._read_only:
+            self._init_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
+            # read_only 进程（dashboard）：URI 只读模式打开，任何意外写直接
+            # 报错而不是形成写事务——从根上杜绝跨进程 WAL 写锁竞争。
+            if self._read_only:
+                conn = sqlite3.connect(
+                    f"file:{self._db_path}?mode=ro", uri=True,
+                    check_same_thread=False, timeout=20,
+                    isolation_level=None,  # autocommit：读路径无悬挂事务
+                )
+                conn.execute("PRAGMA busy_timeout=20000")
+                conn.row_factory = sqlite3.Row
+                self._local.conn = conn
+                return self._local.conn
             conn = sqlite3.connect(
-                str(self._db_path), check_same_thread=False, timeout=10,
+                str(self._db_path), check_same_thread=False, timeout=20,
+                # autocommit：每条语句独立事务立即提交。多进程共享同一
+                # alive.db（WAL 单写者），若保持隐式事务，任何"写后未
+                # commit 即异常"的路径都会让连接永久持有写锁，导致其他
+                # 进程/线程（scheduler tick 等）持续 database is locked。
+                isolation_level=None,
             )
+            # busy_timeout 与 timeout 参数双保险：多进程（gateway 主进程 +
+            # dashboard 进程）共享同一 alive.db，WAL 单写者，写冲突时等待
+            # 而不是立刻抛 database is locked。
+            conn.execute("PRAGMA busy_timeout=20000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.row_factory = sqlite3.Row
@@ -46,7 +79,26 @@ class AliveDB:
                 "ALTER TABLE interests ADD COLUMN user_id TEXT NOT NULL DEFAULT '__global__'")
         except sqlite3.OperationalError:
             pass  # 列已存在
+        # v2.4 §22（1:1 复刻）：mem_nodes 补 atom_type 列（认知五类原子）
+        try:
+            self._get_conn().execute(
+                "ALTER TABLE mem_nodes ADD COLUMN atom_type TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
         self._get_conn().commit()
+        # R-H/24（深度修复）：启动时对 current_state 做单表快速完整性自检
+        # （PRAGMA quick_check 支持按表检查，成本低）。非 "ok" 说明索引/重复
+        # 已受损——立刻告警并给出修复指引，避免带伤运行继续写入重复键。
+        try:
+            r = self._get_conn().execute(
+                "PRAGMA quick_check(current_state)").fetchone()
+            if r and r[0] != "ok":
+                logger.warning(
+                    "[AliveDB] current_state integrity check FAILED: %s "
+                    "（重复键/索引损坏）→ 运行 tests/_rebuild.py 修复",
+                    str(r[0])[:200])
+        except Exception:
+            pass
 
     # ── Per-user state ──
 
@@ -57,13 +109,15 @@ class AliveDB:
         return row["value"] if row else default
 
     def set_state(self, key: str, value: Any, user_id: str = _DEFAULT_USER) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT OR REPLACE INTO current_state(key,user_id,value,updated_at) "
-            "VALUES(?,?,?,datetime('now'))",
-            (key, user_id, value),
-        )
-        conn.commit()
+        # R-H/24：写锁串行化（多线程独立连接 → 写路径单写者）
+        with _WRITE_LOCK:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO current_state(key,user_id,value,updated_at) "
+                "VALUES(?,?,?,datetime('now'))",
+                (key, user_id, value),
+            )
+            conn.commit()
 
     def get_all_state(self, user_id: str = _DEFAULT_USER) -> dict[str, Any]:
         rows = self._get_conn().execute(
@@ -123,11 +177,12 @@ class AliveDB:
         cols = list(data.keys())
         ph = ",".join(["?"] * len(cols))
         upd = ",".join([f"{c}=excluded.{c}" for c in cols if c != "id"])
-        self._get_conn().execute(
-            f"INSERT INTO tasks({','.join(cols)}) VALUES({ph}) ON CONFLICT(id) DO UPDATE SET {upd}",
-            [data[c] for c in cols],
-        )
-        self._get_conn().commit()
+        with _WRITE_LOCK:
+            self._get_conn().execute(
+                f"INSERT INTO tasks({','.join(cols)}) VALUES({ph}) ON CONFLICT(id) DO UPDATE SET {upd}",
+                [data[c] for c in cols],
+            )
+            self._get_conn().commit()
 
     # ── Todo 镜像（三件套桥接②：宿主 todo 清单 → 插件承诺账本）──
 
@@ -140,35 +195,36 @@ class AliveDB:
         """
         conn = self._get_conn()
         seen_ids: set[str] = set()
-        for item in todos:
-            orig_id = str(item.get("id", "")).strip()
-            content = (item.get("content") or "").strip()
-            if not orig_id or not content:
-                continue
-            mid = f"mirror-{orig_id}"
-            seen_ids.add(mid)
-            raw_status = item.get("status", "pending")
-            status = "completed" if raw_status == "completed" else (
-                "in_progress" if raw_status == "in_progress" else "pending")
-            conn.execute(
-                "INSERT INTO tasks(id,title,description,source,status,user_id) "
-                "VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET title=excluded.title, "
-                "status=excluded.status, user_id=excluded.user_id",
-                (mid, content[:100], f"宿主todo原id:{orig_id}", "todo_mirror",
-                 status, user_id),
-            )
-        # 对账：快照中已消失的旧镜像活跃项 → completed
-        rows = conn.execute(
-            "SELECT id FROM tasks WHERE source='todo_mirror' AND user_id=? "
-            "AND status IN ('pending','in_progress')", (user_id,)
-        ).fetchall()
-        for r in rows:
-            if r["id"] not in seen_ids:
+        with _WRITE_LOCK:
+            for item in todos:
+                orig_id = str(item.get("id", "")).strip()
+                content = (item.get("content") or "").strip()
+                if not orig_id or not content:
+                    continue
+                mid = f"mirror-{orig_id}"
+                seen_ids.add(mid)
+                raw_status = item.get("status", "pending")
+                status = "completed" if raw_status == "completed" else (
+                    "in_progress" if raw_status == "in_progress" else "pending")
                 conn.execute(
-                    "UPDATE tasks SET status='completed', "
-                    "completed_at=datetime('now') WHERE id=?", (r["id"],))
-        conn.commit()
+                    "INSERT INTO tasks(id,title,description,source,status,user_id) "
+                    "VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET title=excluded.title, "
+                    "status=excluded.status, user_id=excluded.user_id",
+                    (mid, content[:100], f"宿主todo原id:{orig_id}", "todo_mirror",
+                     status, user_id),
+                )
+            # 对账：快照中已消失的旧镜像活跃项 → completed
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE source='todo_mirror' AND user_id=? "
+                "AND status IN ('pending','in_progress')", (user_id,)
+            ).fetchall()
+            for r in rows:
+                if r["id"] not in seen_ids:
+                    conn.execute(
+                        "UPDATE tasks SET status='completed', "
+                        "completed_at=datetime('now') WHERE id=?", (r["id"],))
+            conn.commit()
 
     def get_active_todos(self, user_id: str) -> list[dict]:
         """读取镜像的活跃 todo（pending/in_progress），用于唤醒轮回灌。"""
@@ -219,13 +275,14 @@ class AliveDB:
     def record_emotion(self, user_id: str, pad_p: float, pad_a: float, pad_d: float,
                        label: str, bond_c: float, bond_d: float, bond_i: float,
                        bond_t: float, trigger: str = "") -> None:
-        self._get_conn().execute(
-            "INSERT INTO emotion_history(timestamp,user_id,pad_p,pad_a,pad_d,emotion_label,"
-            "bond_c,bond_d_rel,bond_i,bond_t,trigger_event) "
-            "VALUES(datetime('now'),?,?,?,?,?,?,?,?,?,?)",
-            (user_id, pad_p, pad_a, pad_d, label, bond_c, bond_d, bond_i, bond_t, trigger),
-        )
-        self._get_conn().commit()
+        with _WRITE_LOCK:
+            self._get_conn().execute(
+                "INSERT INTO emotion_history(timestamp,user_id,pad_p,pad_a,pad_d,emotion_label,"
+                "bond_c,bond_d_rel,bond_i,bond_t,trigger_event) "
+                "VALUES(datetime('now'),?,?,?,?,?,?,?,?,?,?)",
+                (user_id, pad_p, pad_a, pad_d, label, bond_c, bond_d, bond_i, bond_t, trigger),
+            )
+            self._get_conn().commit()
 
     # ── Patrol counter (global) ──
 
@@ -261,27 +318,30 @@ class AliveDB:
     def add_daily_counter(self, dimension: str, direction: str, amount: float,
                           user_id: str = _DEFAULT_USER) -> None:
         key = f"daily_{dimension}_{direction}"
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT INTO current_state(key,user_id,value,updated_at) VALUES(?,?,?,datetime('now')) "
-            "ON CONFLICT(key,user_id) DO UPDATE SET value=value+?, updated_at=datetime('now')",
-            (key, user_id, amount, amount),
-        )
-        conn.commit()
+        with _WRITE_LOCK:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO current_state(key,user_id,value,updated_at) VALUES(?,?,?,datetime('now')) "
+                "ON CONFLICT(key,user_id) DO UPDATE SET value=value+?, updated_at=datetime('now')",
+                (key, user_id, amount, amount),
+            )
+            conn.commit()
 
     def reset_daily_counters(self, user_id: str = _DEFAULT_USER) -> None:
-        self._get_conn().execute(
-            "DELETE FROM current_state WHERE user_id=? AND key LIKE 'daily_%'", (user_id,)
-        )
-        self._get_conn().commit()
+        with _WRITE_LOCK:
+            self._get_conn().execute(
+                "DELETE FROM current_state WHERE user_id=? AND key LIKE 'daily_%'", (user_id,)
+            )
+            self._get_conn().commit()
 
     # ── Message queue (global) ──
 
     def queue_message(self, sender: str, content: str) -> None:
-        self._get_conn().execute(
-            "INSERT INTO message_queue(sender,content) VALUES(?,?)", (sender, content)
-        )
-        self._get_conn().commit()
+        with _WRITE_LOCK:
+            self._get_conn().execute(
+                "INSERT INTO message_queue(sender,content) VALUES(?,?)", (sender, content)
+            )
+            self._get_conn().commit()
 
     def get_queued_messages(self, delivered: bool = False) -> list[dict]:
         return [dict(r) for r in self._get_conn().execute(
@@ -431,6 +491,108 @@ CREATE TABLE IF NOT EXISTS outreach_state (
     cooldown_until TEXT,
     updated_at TEXT DEFAULT (datetime('now'))
 );
+
+-- ═══ DAG 长期记忆库（升级方案 §5）═══
+CREATE TABLE IF NOT EXISTS mem_nodes (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    aliases TEXT DEFAULT '[]',
+    content TEXT DEFAULT '',
+    attrs TEXT DEFAULT '{}',
+    occurred_at TEXT DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '__global__',
+    salience REAL DEFAULT 0.5,
+    importance REAL DEFAULT 0.5,
+    confidence REAL DEFAULT 0.7,
+    reinforcement_count INTEGER DEFAULT 0,
+    source TEXT DEFAULT '',
+    source_ref TEXT DEFAULT '',
+    atom_type TEXT DEFAULT '',
+    status TEXT DEFAULT 'active',
+    superseded_by TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    last_activated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mem_nodes_user_title ON mem_nodes(user_id, title);
+CREATE INDEX IF NOT EXISTS idx_mem_nodes_user_sal ON mem_nodes(user_id, salience DESC);
+CREATE INDEX IF NOT EXISTS idx_mem_nodes_user_time ON mem_nodes(user_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS mem_edges (
+    id TEXT PRIMARY KEY,
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    weight REAL DEFAULT 0.5,
+    user_id TEXT NOT NULL DEFAULT '__global__',
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(from_id, to_id, type)
+);
+CREATE INDEX IF NOT EXISTS idx_mem_edges_from ON mem_edges(from_id);
+CREATE INDEX IF NOT EXISTS idx_mem_edges_to ON mem_edges(to_id);
+
+-- 升级方案 §21（v2.4 经历记忆层）：叙事性经历条目（对齐 livingmemory
+-- documents 层的"全量沉淀兜底"思想，独立重写）。条目层全量入库不丢，
+-- 节点层（mem_nodes）守门择优；检索/注入双源。
+CREATE TABLE IF NOT EXISTS mem_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT '__global__',
+    session_id TEXT DEFAULT '',
+    summary TEXT NOT NULL,
+    topics TEXT DEFAULT '[]',
+    key_facts TEXT DEFAULT '[]',
+    sentiment TEXT DEFAULT 'neutral',
+    importance REAL DEFAULT 0.5,
+    status TEXT DEFAULT 'awake',
+    source TEXT DEFAULT 'reflection',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    last_activated_at TEXT DEFAULT (datetime('now')),
+    activation_count INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_mem_entries_user ON mem_entries(user_id, created_at DESC);
+
+-- v2.4 §21 维护层补齐（对齐 livingmemory memory_sources 思想，独立重写）：
+-- 高重要度条目保留原始消息，可核验/回放（不进检索索引）。
+CREATE TABLE IF NOT EXISTS mem_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL DEFAULT '__global__',
+    role TEXT DEFAULT '',
+    content TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mem_sources_entry ON mem_sources(entry_id);
+
+-- v2.4 §22（1:1 复刻 livingmemory 检索）：BM25(FTS5) 路——unicode61 分词器
+-- 与 livingmemory 同款；中文靠入库前预分词（extract_tokens 空格连接），
+-- bm25() 函数排序。BM25 路与 token 交集路互为校验，RRF 融合。
+CREATE VIRTUAL TABLE IF NOT EXISTS mem_nodes_fts USING fts5(
+    content, node_id UNINDEXED, tokenize='unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS mem_entries_fts USING fts5(
+    content, entry_id UNINDEXED, tokenize='unicode61');
+
+-- v2.4 §22 向量路：向量存储（FAISS Flat 等价的精确最近邻——SQLite 存 json
+-- 向量 + 余弦暴力；记忆量 <500 时毫秒级，零新依赖）。
+CREATE TABLE IF NOT EXISTS mem_vecs (
+    item_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'node',
+    user_id TEXT NOT NULL DEFAULT '__global__',
+    dim INTEGER DEFAULT 0,
+    vec TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS mem_entry_nodes (
+    entry_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    user_id TEXT NOT NULL DEFAULT '__global__',
+    created_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY(entry_id, node_id),
+    FOREIGN KEY(entry_id) REFERENCES mem_entries(id),
+    FOREIGN KEY(node_id) REFERENCES mem_nodes(id)
+);
+CREATE INDEX IF NOT EXISTS idx_mem_entry_nodes_user
+    ON mem_entry_nodes(user_id, entry_id);
 """
 
 # 已有库的增量迁移：老版本建库时没有 outreach_state 表

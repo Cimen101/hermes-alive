@@ -263,9 +263,12 @@ def apply_constraints(pad_changes: dict, bond_changes: dict, current_state: dict
         elif p_delta < 0:
             pad_changes["p"] = p_delta * 0.5
 
-    # 5. Trauma window (T positive penalty)
+    # 5. Trauma window (all bond dimensions dampened)
+    # R-H/14（红队审查）：原先只对 T 正增量 penalty——真实心理中受伤后
+    # 亲密度/依赖/在意同样会退缩，对 bond 全部维度施加同一衰减。
     if current_state.get("trauma_active", False):
-        bond_changes["t"] = bond_changes.get("t", 0.0) * c["trauma_positive_penalty"]
+        for key in bond_changes:
+            bond_changes[key] = bond_changes.get(key, 0.0) * c["trauma_positive_penalty"]
 
     # 6. Relationship maturity multiplier
     maturity = current_state.get("relationship_maturity", 1.0)

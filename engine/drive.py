@@ -23,7 +23,16 @@ class DriveManager:
         self.cfg = cfg
         self._get = get_state
         self._set = set_state
+        # R-H/39（红队）：冷却时间戳持久化——原纯内存态，进程重启/双进程
+        # （gateway+dashboard 各自实例）都会丢失 90min 冷却，重启后可能立即
+        # 再次主动发起（虽有 daily_max 兜底，行为仍毛糙）。启动时回载。
         self._last_initiate_ts = 0.0
+        try:
+            v = self._get("drive_last_initiate_ts", None)
+            if v:
+                self._last_initiate_ts = float(v)
+        except (TypeError, ValueError):
+            self._last_initiate_ts = 0.0
 
     # ── 注入信号 ──
 
@@ -81,6 +90,8 @@ class DriveManager:
     def mark_initiated(self) -> None:
         self._last_initiate_ts = _time.time()
         try:
+            # R-H/39：冷却时间戳同步持久化（全局键，跨重启/双进程共享）
+            self._set("drive_last_initiate_ts", self._last_initiate_ts)
             # R16（审计§十七）：与读方 _daily_count 自洽的 "日期:次数" 格式——
             # 此前写裸整数致读方解析恒失败→daily_max 闸门恒失效
             import datetime as _dt

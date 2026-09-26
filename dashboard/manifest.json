@@ -3,7 +3,7 @@
   "label": "Hermes Alive",
   "description": "拟人生命周期系统管理面板",
   "icon": "Heart",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "tab": {
     "path": "/alive",
     "position": "end"
