@@ -66,6 +66,20 @@ hermes-alive/
 2. 在 `config.yaml` 的 `plugins.enabled` 中加入 `hermes-alive`。
 3. 重启网关（或宿主进程）完成装载。
 
+### 常见安装问题（容器 / bind-mount 场景）
+
+从宿主直接拷入插件目录时，文件属主常为 `root` 且权限过窄，容器内的 Hermes 服务
+用户可能读不到，表现为启动日志出现 `⚠ Could not load config.yaml` 或
+`PermissionError: .../logs/agent.log`。在容器内修正一次即可：
+
+```sh
+docker exec -u 0 <容器> chmod -R a+rX /opt/data/plugins/hermes-alive
+docker exec -u 0 <容器> chown -R <服务用户> /opt/data/plugin-data
+```
+
+Dashboard 绑定 `0.0.0.0` 前需要先配置认证（`dashboard.basic_auth` 或 OAuth），
+否则宿主会拒绝监听非回环地址。
+
 ## 配置
 
 完整配置在 `config.yaml` 的 `plugins.entries.hermes-alive.settings.alive` 下，未配置的键均取合理默认值：
@@ -139,6 +153,8 @@ auxiliary:
 
 持续红队审计累计修复 45 项（时间语义、数值矩阵、多用户隔离、记忆检索、调度架构），
 端到端 / 数值 / 长跑共 21 套测试常绿。审计记录见 [docs/TESTING.md](docs/TESTING.md)。
+另已在**全新 Hermes agent（干净容器）**完成纯净安装验证：插件装载、工具注册、
+数据目录/数据库自建、面板路由挂载与冷启动默认态全部通过。
 
 ## License
 
