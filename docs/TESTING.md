@@ -883,6 +883,51 @@ legacy `plugin-data/hermes-alive/` 仅旧装回退）。本部署中 legacy 是 
 
 ---
 
+### 10.26 GitHub 发布同步 v1.1.0（09-26）
+
+**同步事件**：`Cimen101/hermes-alive` 提交 `0810f61`（26 文件，+4550/-212）——
+补齐此前缺失的整个 `memory/` 目录（6 文件）；engine/dashboard/storage/observer 全量
+同步至含 45 项红队修复的最新实现；README/DESIGN 更新（长期记忆特性/架构/工具清单/
+记忆系统章节）；新增 `docs/TESTING.md`（本报告快照）；plugin.yaml 与 dashboard
+manifest 版本 1.0.0 → 1.1.0（provides_tools 修正为真实工具名）。
+**核验**：远端文件尺寸与本地逐字节一致（__init__.py 130947 / README 7618 /
+DESIGN 15345 / TESTING.md 62851），memory/ 目录就位；未变更文件 sha 不变（行尾
+归一无损）。**后续约定**：发布同步工作副本为 `release/hermes-alive/`（其内嵌
+`.git` 即本仓库，v1.1.0 后已理顺至 origin/main；会话中临时克隆 `_gh_sync/` 已删除）；
+流程 = 修改/刷新文件 → commit → push；`docs/TESTING.md` 为本报告快照，
+报告更新后须同步再推（09-26 复查：代码 32 文件 0 差异，仅报告快照滞后已补）。
+
+### 10.27 全新 Hermes agent 纯净安装验证（09-26）
+
+**测试环境**：新容器 `hermes-fresh-test`（同镜像 `hermes-agent:v2.4-alive-faiss`），
+空数据目录（宿主 `C:\Users\RAINBOW\.hermes-fresh-test`），仅安装 GitHub 发布版
+插件（`release/hermes-alive` v1.1.0）+ 最小 config.yaml（启用 hermes-alive + dashboard 认证）。
+
+**结果（全绿，未发现插件缺陷）**：
+- 插件装载：dashboard 与 gateway 双进程均成功 —— `[Hermes Alive] engine created OK (v6)`
+  + 3 工具注册（alive_social_status / memory_recall / memory_memorize）；
+  `Hermes Alive plugin registered (v7)`
+- 数据目录自建：`plugin-data/agent-plugin-hermes-alive-80e90b66/`（与生产同名确定性
+  hash）+ alive.db / WAL / scheduler.lock 自动生成
+- 冷启动 DB：28 表建齐（生产 29 = 多一张历史杂表 `_t`）；初始态落库正确
+  （energy=80 / boredom=30 / stress=10 / clock=waking / activity_mode=working，
+  仅 `__global__` 12 键）
+- 面板 API：`Mounted plugin API routes: /api/plugins/hermes-alive/`，认证网关闭环
+  （未登录返回结构化 401）；dashboard 日志 `HERMES_DASHBOARD_READY`
+- 双进程单时钟：dashboard 先起持 scheduler.lock，gateway 侧 "standing down"
+  （R-H flock 设计生效）
+- 日志净：agent.log 零 Traceback/ERROR；errors.log 仅两条全新装预期警告（无平台/无白名单）
+
+**环境侧发现（非插件缺陷，已写入 README「常见安装问题」并推送 c7a911d）**：
+① 宿主直拷文件在容器内属主 root/权限过窄 → `Could not load config.yaml` +
+`PermissionError: logs/agent.log`（chmod a+rX + chown 修正即恢复）；
+② dashboard 绑 0.0.0.0 前需先配 `dashboard.basic_auth`（宿主安全策略拒绝无认证公网监听）。
+
+**遗留**：测试容器已停止（`docker start hermes-fresh-test` 可复看，端口 9120）；
+数据目录保留作证据。
+
+---
+
 ## 附录 A：配置基准（config.py 关键值）
 
 ```python
